@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include <dirent.h>
 #include <getopt.h>
 #include <inttypes.h>
@@ -5,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -20,6 +23,7 @@
 struct proc {
     pid_t pid;
     pid_t ppid;
+    uid_t uid;
     char user[9];
     uint64_t start_ns;   /* since boot; only precise to 1/100 s */
     uint64_t cpu_ns;
@@ -31,25 +35,26 @@ struct proc {
     char *cmd;
 };
 
-enum column { COL_PID, COL_PPID, COL_USER, COL_ELAPSED, COL_CPU, COL_PCPU, COL_NOW, COL_RSS, COL_PMEM,
+/* In display order: a column added with +name goes to its place in this order. */
+enum column { COL_PID, COL_PPID, COL_USER, COL_TIME, COL_CPU, COL_PCPU, COL_NOW, COL_RSS, COL_PMEM,
               COL_CMD, COL_COUNT };
 
 static const struct {
     const char *name;
     const char *header;
-    int width;  /* negative: left-aligned, 0: no padding */
+    int left;  /* left-aligned (text) rather than right-aligned (numbers) */
     const char *desc;
 } columns[COL_COUNT] = {
-    [COL_PID]     = {"pid",     "PID",      7, "process ID"},
-    [COL_PPID]    = {"ppid",    "PPID",     7, "parent process ID"},
-    [COL_USER]    = {"user",    "USER",    -8, "owner (effective user)"},
-    [COL_ELAPSED] = {"elapsed", "ELAPSED", 13, "time since start, seconds"},
-    [COL_CPU]     = {"cpu",     "CPU",     16, "CPU time used, seconds"},
-    [COL_PCPU]    = {"pcpu",    "%CPU",    11, "CPU time / elapsed time"},
-    [COL_NOW]     = {"now",     "%NOW",    11, "CPU usage during the -c interval"},
-    [COL_RSS]     = {"rss",     "RSS",     10, "resident memory, MiB"},
-    [COL_PMEM]    = {"pmem",    "%MEM",     7, "RSS / total RAM"},
-    [COL_CMD]     = {"cmd",     "CMD",      0, "command line"},
+    [COL_PID]  = {"pid",  "PID",  0, "process ID"},
+    [COL_PPID] = {"ppid", "PPID", 0, "parent process ID"},
+    [COL_USER] = {"user", "USER", 1, "owner (effective user)"},
+    [COL_TIME] = {"time", "TIME", 0, "time since start (elapsed), HH:MM:SS"},
+    [COL_CPU]  = {"cpu",  "CPU",  0, "CPU time used, seconds"},
+    [COL_PCPU] = {"avg",  "%AVG",     0, "average CPU usage: CPU time / elapsed time"},
+    [COL_NOW]  = {"now",  "%CPU",     0, "current CPU usage, during the -c interval"},
+    [COL_RSS]  = {"rss",  "RSS",  0, "resident memory, MiB"},
+    [COL_PMEM] = {"pmem", "%MEM", 0, "RSS / total RAM"},
+    [COL_CMD]  = {"cmd",  "CMD",  1, "command line"},
 };
 
 static long ticks_per_sec;
@@ -58,6 +63,14 @@ static uint64_t total_ram;
 
 static enum column sort_col = COL_PID;
 static int sort_desc;
+
+static int precise;    /* -p: full precision instead of human-friendly values */
+static char mem_unit;  /* -B/-K/-M/-G, 0: pick per value */
+static int color;      /* highlight the leading part of numbers (terminal only) */
+
+#define BOLD "\033[1m"
+#define DIM "\033[2m"
+#define RESET "\033[0m"
 
 static uint64_t clock_ns(clockid_t clock) {
     struct timespec ts;
@@ -181,6 +194,7 @@ static int read_proc(struct proc *p) {
     if (stat(path, &st) < 0 || read_sample(p) < 0)
         return -1;
 
+    p->uid = st.st_uid;
     snprintf(p->user, sizeof p->user, "%s", user_name(st.st_uid));
     p->elapsed_ns = p->sample_ns - p->start_ns;
     p->pcpu = p->elapsed_ns ? 100.0 * p->cpu_ns / p->elapsed_ns : 0;
@@ -241,7 +255,8 @@ static int compare_procs(const void *a, const void *b) {
     case COL_PID:     r = CMP(p->pid, q->pid); break;
     case COL_PPID:    r = CMP(p->ppid, q->ppid); break;
     case COL_USER:    r = strcmp(p->user, q->user); break;
-    case COL_ELAPSED: r = CMP(p->elapsed_ns, q->elapsed_ns); break;
+    /* By start time: elapsed_ns also depends on when each process was read. */
+    case COL_TIME:    r = CMP(q->start_ns, p->start_ns); break;
     case COL_CPU:     r = CMP(p->cpu_ns, q->cpu_ns); break;
     case COL_PCPU:    r = CMP(p->pcpu, q->pcpu); break;
     case COL_NOW:     r = CMP(p->now, q->now); break;
@@ -255,6 +270,112 @@ static int compare_procs(const void *a, const void *b) {
     return r ? r : CMP(p->pid, q->pid);
 }
 
+/* head + tail into buf; head bold and tail dim, so the magnitude stands out. */
+static void emit(char *buf, size_t size, const char *head, const char *tail) {
+    if (color)
+        snprintf(buf, size, BOLD "%s" RESET DIM "%s" RESET, head, tail);
+    else
+        snprintf(buf, size, "%s%s", head, tail);
+}
+
+/* A number with the part before the decimal point highlighted, e.g. "12.345s". */
+static void emit_number(char *buf, size_t size, const char *num, const char *unit) {
+    char head[64], tail[64];
+    size_t n = strcspn(num, ".");
+    snprintf(head, sizeof head, "%.*s", (int)n, num);
+    snprintf(tail, sizeof tail, "%s%s", num + n, unit);
+    emit(buf, size, head, tail);
+}
+
+/* Human-friendly: one decimal fewer from 10 up, and another from 100 up. */
+static void emit_human(char *buf, size_t size, double v, int decimals, const char *unit) {
+    char num[64];
+    if (v >= 10)
+        decimals--;
+    if (v >= 100)
+        decimals--;
+    snprintf(num, sizeof num, "%.*f", decimals > 0 ? decimals : 0, v);
+    emit_number(buf, size, num, unit);
+}
+
+/* Fixed number of significant digits, the decimal point moving as the value
+ * grows: 1.23456, 12.3456, 123.456, ... */
+static void emit_digits(char *buf, size_t size, double v, int digits, const char *unit) {
+    char num[64];
+    int decimals = digits - 1;
+    for (double limit = 10; v >= limit && decimals > 0; limit *= 10)
+        decimals--;
+    snprintf(num, sizeof num, "%.*f", decimals, v);
+    emit_number(buf, size, num, unit);
+}
+
+static void format_time(char *buf, size_t size, uint64_t ns) {
+    char num[64];
+    if (precise) {
+        /* Start time comes from stat in 1/100 s, so 2 decimals. */
+        snprintf(num, sizeof num, "%" PRIu64 ".%02" PRIu64, ns / NS_PER_SEC,
+                 ns % NS_PER_SEC / 10000000);
+        emit_number(buf, size, num, "s");
+        return;
+    }
+
+    /* HH:MM:SS (hours keep counting past a day), hours and minutes highlighted. */
+    uint64_t sec = ns / NS_PER_SEC;
+    char head[32], tail[8];
+    snprintf(head, sizeof head, "%02" PRIu64 ":%02" PRIu64, sec / 3600, sec / 60 % 60);
+    snprintf(tail, sizeof tail, ":%02" PRIu64, sec % 60);
+    emit(buf, size, head, tail);
+}
+
+static void format_cpu(char *buf, size_t size, uint64_t ns) {
+    if (precise) {
+        char num[64];
+        snprintf(num, sizeof num, "%" PRIu64 ".%06" PRIu64, ns / NS_PER_SEC,
+                 ns % NS_PER_SEC / 1000);
+        emit_number(buf, size, num, "s");
+    } else {
+        emit_digits(buf, size, (double)ns / NS_PER_SEC, 6, "s");
+    }
+}
+
+static void format_percent(char *buf, size_t size, double v, int precise_decimals) {
+    if (precise) {
+        char num[64];
+        snprintf(num, sizeof num, "%.*f", precise_decimals, v);
+        emit_number(buf, size, num, "");
+    } else {
+        emit_digits(buf, size, v, 6, "");
+    }
+}
+
+static void format_mem(char *buf, size_t size, uint64_t bytes) {
+    char unit = mem_unit;
+    if (!unit)
+        unit = precise ? 'M' : bytes < (1 << 20) ? 'K' : bytes < (1 << 30) ? 'M' : 'G';
+
+    char num[64], suffix[2] = {unit, 0};
+    switch (unit) {
+    case 'B':
+    case 'K':
+        /* Whole kilobytes are exact: memory comes in pages. */
+        snprintf(num, sizeof num, "%" PRIu64, unit == 'B' ? bytes : bytes >> 10);
+        emit_number(buf, size, num, suffix);
+        break;
+    default: {
+        double v = (double)bytes / (unit == 'M' ? 1 << 20 : 1 << 30);
+        if (precise) {
+            snprintf(num, sizeof num, "%.*f", unit == 'M' ? 2 : 3, v);
+            emit_number(buf, size, num, suffix);
+        } else if (unit == 'M') {
+            snprintf(num, sizeof num, "%.0f", v);
+            emit_number(buf, size, num, suffix);
+        } else {
+            emit_human(buf, size, v, 2, suffix);
+        }
+    }
+    }
+}
+
 static void format_value(char *buf, size_t size, const struct proc *p, enum column col) {
     switch (col) {
     case COL_PID:
@@ -266,27 +387,29 @@ static void format_value(char *buf, size_t size, const struct proc *p, enum colu
     case COL_USER:
         snprintf(buf, size, "%s", p->user);
         break;
-    case COL_ELAPSED:
-        /* Start time comes from stat in 1/100 s, so 2 decimals. */
-        snprintf(buf, size, "%" PRIu64 ".%02" PRIu64 "s",
-                 p->elapsed_ns / NS_PER_SEC, p->elapsed_ns % NS_PER_SEC / 10000000);
+    case COL_TIME:
+        format_time(buf, size, p->elapsed_ns);
         break;
     case COL_CPU:
-        snprintf(buf, size, "%" PRIu64 ".%06" PRIu64 "s",
-                 p->cpu_ns / NS_PER_SEC, p->cpu_ns % NS_PER_SEC / 1000);
+        format_cpu(buf, size, p->cpu_ns);
         break;
     case COL_PCPU:
-        snprintf(buf, size, "%.5f", p->pcpu);
+        format_percent(buf, size, p->pcpu, 5);
         break;
     case COL_NOW:
-        snprintf(buf, size, "%.5f", p->now);
+        format_percent(buf, size, p->now, 5);
         break;
     case COL_RSS:
-        snprintf(buf, size, "%.2fM", p->rss / 1048576.0);
+        format_mem(buf, size, p->rss);
         break;
-    case COL_PMEM:
-        snprintf(buf, size, "%.3f", total_ram ? 100.0 * p->rss / total_ram : 0);
+    case COL_PMEM: {
+        double v = total_ram ? 100.0 * p->rss / total_ram : 0;
+        if (precise)
+            format_percent(buf, size, v, 3);
+        else
+            emit_human(buf, size, v, 2, "");
         break;
+    }
     case COL_CMD:
         snprintf(buf, size, "%s", p->cmd);
         break;
@@ -296,44 +419,111 @@ static void format_value(char *buf, size_t size, const struct proc *p, enum colu
     }
 }
 
+/* Skips a color escape sequence ("\033[...m") starting at s, if any. */
+static const char *skip_escape(const char *s) {
+    if (*s != '\033')
+        return s;
+    while (*s && *s != 'm')
+        s++;
+    return *s ? s + 1 : s;
+}
+
 /* Prints s, but at most cols characters (cols < 0: no limit). Counts UTF-8
- * characters rather than bytes so a multi-byte character is never split. */
+ * characters rather than bytes so a multi-byte character is never split,
+ * and color escapes take no space. */
 static void print_cut(const char *s, int cols) {
     const char *end = s;
-    for (; *end; end++) {
-        if (((unsigned char)*end & 0xc0) == 0x80)
+    while (*end) {
+        const char *next = skip_escape(end);
+        if (next != end) {
+            end = next;
             continue;
-        if (cols-- == 0)
+        }
+        if (((unsigned char)*end & 0xc0) != 0x80 && cols-- == 0)
             break;
+        end++;
     }
     fwrite(s, 1, end - s, stdout);
+    if (color)
+        fputs(RESET, stdout);  /* in case the cut fell inside highlighted text */
     putchar('\n');
 }
 
-/* One output line; p == NULL prints the header. */
-static void print_line(const struct proc *p, const enum column *cols, int ncols, int term_cols) {
+/* Display width of a UTF-8 string: characters, not bytes, without escapes. */
+static int text_width(const char *s) {
+    int n = 0;
+    while (*s) {
+        const char *next = skip_escape(s);
+        if (next != s) {
+            s = next;
+            continue;
+        }
+        if (((unsigned char)*s & 0xc0) != 0x80)
+            n++;
+        s++;
+    }
+    return n;
+}
+
+/* Value of a column; p == NULL gives the header. */
+static void column_text(char *buf, size_t size, const struct proc *p, enum column col) {
+    if (p)
+        format_value(buf, size, p, col);
+    else
+        snprintf(buf, size, "%s", columns[col].header);
+}
+
+static void print_line(const struct proc *p, const enum column *cols, const int *widths,
+                       int ncols, int term_cols) {
     char line[LINE_MAX_LEN], value[CMDLINE_MAX];
     size_t pos = 0;
 
-    for (int i = 0; i < ncols && pos < sizeof line; i++) {
-        if (p)
-            format_value(value, sizeof value, p, cols[i]);
-        else
-            snprintf(value, sizeof value, "%s", columns[cols[i]].header);
-        int n = snprintf(line + pos, sizeof line - pos, "%s%*s",
-                         i ? " " : "", columns[cols[i]].width, value);
-        if (n > 0)
-            pos += n;
+    for (int i = 0; i < ncols; i++) {
+        column_text(value, sizeof value, p, cols[i]);
+        int pad = widths[i] - text_width(value);
+        int left = columns[cols[i]].left;
+        if (left && i == ncols - 1)
+            pad = 0;  /* no trailing spaces after the last column */
+        int n = snprintf(line + pos, sizeof line - pos, "%s%*s%s%*s", i ? "  " : "",
+                         left ? 0 : pad, "", value, left ? pad : 0, "");
+        if (n < 0 || (pos += n) >= sizeof line) {
+            pos = sizeof line - 1;
+            break;
+        }
     }
     print_cut(line, term_cols);
 }
 
-static enum column find_column(const char *name) {
+static int lookup_column(const char *name) {
     for (int c = 0; c < COL_COUNT; c++)
-        if (strcmp(columns[c].name, name) == 0)
+        if (strcasecmp(columns[c].name, name) == 0)
             return c;
-    fprintf(stderr, "minips: unknown column '%s' (see --help)\n", name);
-    exit(2);
+    return -1;
+}
+
+static enum column find_column(const char *name) {
+    int c = lookup_column(name);
+    if (c < 0) {
+        fprintf(stderr, "minips: unknown column '%s' (see --help)\n", name);
+        exit(2);
+    }
+    return c;
+}
+
+/* Whether a short-option argument like "-rs" leaves its value in the next
+ * argument, which then must not be taken for a "-col" toggle (-s -cpu). */
+static int value_in_next_arg(const char *arg) {
+    if (strcmp(arg, "--sort") == 0 || strcmp(arg, "--columns") == 0)
+        return 1;
+    if (arg[0] != '-' || arg[1] == '-')
+        return 0;
+    for (const char *s = arg + 1; *s; s++) {
+        if (*s == 'c')
+            return 0;  /* optional value, only ever attached */
+        if (*s == 's' || *s == 'o')
+            return s[1] == 0;
+    }
+    return 0;
 }
 
 static int parse_delay(const char *s, double *out) {
@@ -347,10 +537,17 @@ static int parse_delay(const char *s, double *out) {
 
 static void usage(FILE *f) {
     fprintf(f,
-            "Usage: minips [-c [SEC]] [-o COLUMNS] [-s [-]COLUMN] [-r]\n"
+            "Usage: minips [OPTIONS] [+COLUMN] [-COLUMN] [FILTER...]\n"
             "\n"
+            "Shows your processes; FILTER shows only those whose command line contains\n"
+            "any of the given texts (ignoring case).\n"
+            "\n"
+            "  +COL, -COL           add / remove a column (to the defaults or the -o list)\n"
+            "  -a, --all            show processes of all users\n"
+            "  -p, --precise        full precision (times in s, CPU time in us)\n"
+            "  -B, -K, -M, -G       memory in bytes / KiB / MiB / GiB (default: per value)\n"
             "  -c, --current[=SEC]  measure current CPU usage over SEC seconds (default 1);\n"
-            "                       adds the 'now' column and sorts by it (busiest last)\n"
+            "                       adds the 'now' (%%CPU) column and sorts by it (busiest last)\n"
             "  -o, --columns=LIST   comma-separated columns to show\n"
             "  -s, --sort=[-]COL    sort by COL, '-' for descending (default: pid)\n"
             "  -r, --reverse        reverse the sort order\n"
@@ -367,6 +564,8 @@ int main(int argc, char **argv) {
         {"columns", required_argument, NULL, 'o'},
         {"sort",    required_argument, NULL, 's'},
         {"reverse", no_argument,       NULL, 'r'},
+        {"all",     no_argument,       NULL, 'a'},
+        {"precise", no_argument,       NULL, 'p'},
         {"help",    no_argument,       NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
@@ -375,9 +574,41 @@ int main(int argc, char **argv) {
     const char *columns_arg = NULL;
     const char *sort_arg = NULL;
     int reverse = 0;
+    int all = 0;
+
+    /* "+col" / "-col" add or remove columns. Take them out before getopt,
+     * which would read "-rss" as "-r -s s". */
+    enum column toggle_col[MAX_COLUMNS];
+    int toggle_add[MAX_COLUMNS], ntoggles = 0;
+    int kept = 1;
+    for (int i = 1; i < argc; i++) {
+        const char *arg = argv[i];
+        int col;
+        if (strcmp(arg, "--") == 0) {
+            while (i < argc)
+                argv[kept++] = argv[i++];
+            break;
+        }
+        if (arg[0] == '+' && arg[1])
+            find_column(arg + 1);  /* exits on an unknown name */
+        if ((arg[0] == '+' || arg[0] == '-') && (col = lookup_column(arg + 1)) >= 0) {
+            if (ntoggles == MAX_COLUMNS) {
+                fprintf(stderr, "minips: too many columns\n");
+                return 2;
+            }
+            toggle_col[ntoggles] = col;
+            toggle_add[ntoggles++] = arg[0] == '+';
+            continue;
+        }
+        argv[kept++] = argv[i];
+        if (value_in_next_arg(arg) && i + 1 < argc)
+            argv[kept++] = argv[++i];
+    }
+    argc = kept;
+    argv[argc] = NULL;
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "c::o:s:rh", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "c::o:s:raphBKMG", long_options, NULL)) != -1) {
         switch (opt) {
         case 'c':
             delay = 1;
@@ -398,6 +629,18 @@ int main(int argc, char **argv) {
         case 'r':
             reverse = 1;
             break;
+        case 'a':
+            all = 1;
+            break;
+        case 'p':
+            precise = 1;
+            break;
+        case 'B':
+        case 'K':
+        case 'M':
+        case 'G':
+            mem_unit = opt;
+            break;
         case 'h':
             usage(stdout);
             return 0;
@@ -406,16 +649,14 @@ int main(int argc, char **argv) {
             return 2;
         }
     }
-    if (optind < argc) {
-        fprintf(stderr, "minips: unexpected argument '%s'\n", argv[optind]);
-        return 2;
-    }
+    char **filters = argv + optind;
+    int nfilters = argc - optind;
 
     enum column cols[MAX_COLUMNS];
     int ncols = 0;
     char *list = strdup(columns_arg ? columns_arg
-                        : delay ? "pid,ppid,user,elapsed,cpu,now,pcpu,rss,cmd"
-                                : "pid,ppid,user,elapsed,cpu,pcpu,rss,cmd");
+                        : delay ? "pid,user,time,cpu,avg,now,rss,cmd"
+                                : "pid,user,time,cpu,avg,rss,cmd");
     for (char *name = strtok(list, ","); name; name = strtok(NULL, ",")) {
         if (ncols == MAX_COLUMNS) {
             fprintf(stderr, "minips: too many columns\n");
@@ -424,6 +665,30 @@ int main(int argc, char **argv) {
         cols[ncols++] = find_column(name);
     }
     free(list);
+
+    for (int t = 0; t < ntoggles; t++) {
+        enum column col = toggle_col[t];
+        int at = 0, present = 0;
+        for (int i = 0; i < ncols; i++)
+            present |= cols[i] == col;
+        if (!toggle_add[t]) {
+            for (int i = 0; i < ncols; i++)
+                if (cols[i] != col)
+                    cols[at++] = cols[i];
+            ncols = at;
+        } else if (!present) {
+            if (ncols == MAX_COLUMNS) {
+                fprintf(stderr, "minips: too many columns\n");
+                return 2;
+            }
+            /* Before the first column that comes later in display order. */
+            while (at < ncols && cols[at] < col)
+                at++;
+            memmove(&cols[at + 1], &cols[at], (ncols - at) * sizeof *cols);
+            cols[at] = col;
+            ncols++;
+        }
+    }
 
     if (sort_arg) {
         sort_desc = sort_arg[0] == '-';
@@ -437,7 +702,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < ncols; i++)
         uses_now |= cols[i] == COL_NOW;
     if (uses_now && !delay) {
-        fprintf(stderr, "minips: the 'now' column needs -c\n");
+        fprintf(stderr, "minips: the 'now' (%%CPU) column needs -c\n");
         return 2;
     }
 
@@ -447,6 +712,7 @@ int main(int argc, char **argv) {
 
     /* Cut lines to the terminal width; when piped, print everything. */
     int tty = isatty(STDOUT_FILENO);
+    color = tty && !getenv("NO_COLOR");
     struct winsize ws;
     int term_cols = -1;
     if (tty && ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
@@ -473,6 +739,17 @@ int main(int argc, char **argv) {
         struct proc *p = &procs[i];
         if (read_proc(p) < 0)
             continue;
+        if (!all && p->uid != geteuid())
+            continue;
+        if (nfilters) {
+            if (p->pid == getpid())
+                continue;  /* our own command line contains the filter */
+            int match = 0;
+            for (int f = 0; f < nfilters && !match; f++)
+                match = strcasestr(p->cmd, filters[f]) != NULL;
+            if (!match)
+                continue;
+        }
 
         if (delay) {
             struct proc *prev = bsearch(p, first, nfirst, sizeof *first, compare_pid);
@@ -488,13 +765,26 @@ int main(int argc, char **argv) {
 
     qsort(procs, shown, sizeof *procs, compare_procs);
 
-    print_line(NULL, cols, ncols, term_cols);
+    /* Each column as wide as its widest value (or header). */
+    int widths[MAX_COLUMNS];
+    char value[CMDLINE_MAX];
+    for (int i = 0; i < ncols; i++) {
+        widths[i] = text_width(columns[cols[i]].header);
+        for (size_t j = 0; j < shown; j++) {
+            format_value(value, sizeof value, &procs[j], cols[i]);
+            int w = text_width(value);
+            if (w > widths[i])
+                widths[i] = w;
+        }
+    }
+
+    print_line(NULL, cols, widths, ncols, term_cols);
     for (size_t i = 0; i < shown; i++)
-        print_line(&procs[i], cols, ncols, term_cols);
+        print_line(&procs[i], cols, widths, ncols, term_cols);
     /* The top header has scrolled away by now; repeat it next to the prompt.
      * Not when piped, where it would just be an extra line to filter out. */
     if (tty)
-        print_line(NULL, cols, ncols, term_cols);
+        print_line(NULL, cols, widths, ncols, term_cols);
 
     return 0;
 }
