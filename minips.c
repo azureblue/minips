@@ -778,7 +778,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    print_line(NULL, cols, widths, ncols, term_cols);
+    // print_line(NULL, cols, widths, ncols, term_cols);
     for (size_t i = 0; i < shown; i++)
         print_line(&procs[i], cols, widths, ncols, term_cols);
     /* The top header has scrolled away by now; repeat it next to the prompt.
