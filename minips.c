@@ -35,6 +35,8 @@ struct proc {
     char *cmd;
 };
 
+typedef struct proc proc_t;
+
 /* In display order: a column added with +name goes to its place in this order. */
 enum column { COL_PID, COL_PPID, COL_USER, COL_TIME, COL_CPU, COL_PCPU, COL_NOW, COL_RSS, COL_PMEM,
               COL_CMD, COL_COUNT };
@@ -45,16 +47,16 @@ static const struct {
     int left;  /* left-aligned (text) rather than right-aligned (numbers) */
     const char *desc;
 } columns[COL_COUNT] = {
-    [COL_PID]  = {"pid",  "PID",  0, "process ID"},
-    [COL_PPID] = {"ppid", "PPID", 0, "parent process ID"},
-    [COL_USER] = {"user", "USER", 1, "owner (effective user)"},
-    [COL_TIME] = {"time", "TIME", 0, "time since start (elapsed), HH:MM:SS"},
-    [COL_CPU]  = {"cpu",  "CPU",  0, "CPU time used, seconds"},
-    [COL_PCPU] = {"avg",  "%AVG",     0, "average CPU usage: CPU time / elapsed time"},
-    [COL_NOW]  = {"now",  "%CPU",     0, "current CPU usage, during the -c interval"},
-    [COL_RSS]  = {"rss",  "RSS",  0, "resident memory, MiB"},
-    [COL_PMEM] = {"pmem", "%MEM", 0, "RSS / total RAM"},
-    [COL_CMD]  = {"cmd",  "CMD",  1, "command line"},
+    [COL_PID]  = {"pid",  "pid",  0, "process ID"},
+    [COL_PPID] = {"ppid", "ppid", 0, "parent process ID"},
+    [COL_USER] = {"user", "user", 1, "owner (effective user)"},
+    [COL_TIME] = {"time", "time", 0, "time since start (elapsed), HH:MM:SS"},
+    [COL_CPU]  = {"cpu",  "cpu",  0, "CPU time used, seconds"},
+    [COL_PCPU] = {"avg",  "%avg",     0, "average CPU usage: CPU time / elapsed time"},
+    [COL_NOW]  = {"now",  "%cpu",     0, "current CPU usage, during the -c interval"},
+    [COL_RSS]  = {"rss",  "rss",  0, "resident memory, MiB"},
+    [COL_PMEM] = {"pmem", "%mem", 0, "RSS / total RAM"},
+    [COL_CMD]  = {"cmd",  "cmd",  1, "command line"},
 };
 
 static long ticks_per_sec;
@@ -93,7 +95,7 @@ static long read_proc_file(pid_t pid, const char *file, char *buf, size_t size) 
 
 /* Start time (field 22 of stat) and CPU time, and the moment CPU time was
  * read. This is all that is needed for each of the two -c samples. */
-static int read_sample(struct proc *p) {
+static int read_sample(proc_t *p) {
     char buf[1024];
     if (read_proc_file(p->pid, "stat", buf, sizeof buf) <= 0)
         return -1;
@@ -187,7 +189,7 @@ static uint64_t read_rss(pid_t pid) {
     return strtoull(s, NULL, 10) * page_size;
 }
 
-static int read_proc(struct proc *p) {
+static int read_proc(proc_t *p) {
     char path[64];
     struct stat st;
     snprintf(path, sizeof path, "/proc/%d", (int)p->pid);
@@ -213,11 +215,11 @@ static int is_pid(const char *s) {
 }
 
 static int compare_pid(const void *a, const void *b) {
-    return CMP(((const struct proc *)a)->pid, ((const struct proc *)b)->pid);
+    return CMP(((const proc_t *)a)->pid, ((const proc_t *)b)->pid);
 }
 
 /* All PIDs in /proc, sorted. Only pid is filled in. */
-static size_t scan_pids(struct proc **out) {
+static size_t scan_pids(proc_t **out) {
     DIR *dir = opendir("/proc");
     if (!dir) {
         perror("/proc");
@@ -225,7 +227,7 @@ static size_t scan_pids(struct proc **out) {
     }
 
     size_t n = 0, cap = 0;
-    struct proc *procs = NULL;
+    proc_t *procs = NULL;
     struct dirent *de;
     while ((de = readdir(dir))) {
         if (!is_pid(de->d_name))
@@ -249,7 +251,7 @@ static size_t scan_pids(struct proc **out) {
 }
 
 static int compare_procs(const void *a, const void *b) {
-    const struct proc *p = a, *q = b;
+    const proc_t *p = a, *q = b;
     int r = 0;
     switch (sort_col) {
     case COL_PID:     r = CMP(p->pid, q->pid); break;
@@ -376,7 +378,7 @@ static void format_mem(char *buf, size_t size, uint64_t bytes) {
     }
 }
 
-static void format_value(char *buf, size_t size, const struct proc *p, enum column col) {
+static void format_value(char *buf, size_t size, const proc_t *p, enum column col) {
     switch (col) {
     case COL_PID:
         snprintf(buf, size, "%d", (int)p->pid);
@@ -466,14 +468,14 @@ static int text_width(const char *s) {
 }
 
 /* Value of a column; p == NULL gives the header. */
-static void column_text(char *buf, size_t size, const struct proc *p, enum column col) {
+static void column_text(char *buf, size_t size, const proc_t *p, enum column col) {
     if (p)
         format_value(buf, size, p, col);
     else
         snprintf(buf, size, "%s", columns[col].header);
 }
 
-static void print_line(const struct proc *p, const enum column *cols, const int *widths,
+static void print_line(const proc_t *p, const enum column *cols, const int *widths,
                        int ncols, int term_cols) {
     char line[LINE_MAX_LEN], value[CMDLINE_MAX];
     size_t pos = 0;
@@ -718,7 +720,7 @@ int main(int argc, char **argv) {
     if (tty && ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
         term_cols = ws.ws_col;
 
-    struct proc *first = NULL;
+    proc_t *first = NULL;
     size_t nfirst = 0;
     uint64_t interval_start_ns = 0;
     if (delay) {
@@ -733,10 +735,10 @@ int main(int argc, char **argv) {
             ;
     }
 
-    struct proc *procs;
+    proc_t *procs;
     size_t n = scan_pids(&procs), shown = 0;
     for (size_t i = 0; i < n; i++) {
-        struct proc *p = &procs[i];
+        proc_t *p = &procs[i];
         if (read_proc(p) < 0)
             continue;
         if (!all && p->uid != geteuid())
@@ -752,7 +754,7 @@ int main(int argc, char **argv) {
         }
 
         if (delay) {
-            struct proc *prev = bsearch(p, first, nfirst, sizeof *first, compare_pid);
+            proc_t *prev = bsearch(p, first, nfirst, sizeof *first, compare_pid);
             if (prev && prev->sample_ns && prev->start_ns == p->start_ns)
                 p->now = 100.0 * (p->cpu_ns - prev->cpu_ns) / (p->sample_ns - prev->sample_ns);
             else
