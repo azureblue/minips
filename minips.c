@@ -357,6 +357,74 @@ static void format_percent(char *buf, size_t size, double v, int precise_decimal
     }
 }
 
+/* End of the word starting at s (spaces separate words). */
+static const char *word_end(const char *s) {
+    return s + strcspn(s, " ");
+}
+
+static const char *skip_spaces(const char *s) {
+    return s + strspn(s, " ");
+}
+
+/* Start of the program name in the word s..end: after the last '/'. */
+static const char *base_name(const char *s, const char *end) {
+    const char *base = s;
+    for (; s < end; s++)
+        if (*s == '/')
+            base = s + 1;
+    return base;
+}
+
+/* The command with only the program name normal; its directory and the
+ * arguments are dimmed. After sudo (and its options), the name of the command
+ * it runs stays normal too: "sudo -u bob /usr/bin/vim x.txt". Kernel threads,
+ * shown as "[name]", are dimmed entirely. */
+static void format_cmd(char *buf, size_t size, const char *cmd) {
+    if (!color) {
+        snprintf(buf, size, "%s", cmd);
+        return;
+    }
+    if (cmd[0] == '[') {
+        snprintf(buf, size, DIM "%s" RESET, cmd);
+        return;
+    }
+
+    /* Up to two names to keep normal: sudo's and the command's. */
+    const char *names[2][2];
+    int nnames = 0;
+    const char *end = word_end(cmd);
+    const char *base = base_name(cmd, end);
+    names[nnames][0] = base;
+    names[nnames++][1] = end;
+    if (end - base == 4 && strncmp(base, "sudo", 4) == 0) {
+        const char *s = skip_spaces(end);
+        while (*s == '-') {
+            /* Options that take a value: -u USER, -g GROUP, ... */
+            int value = strchr("ughpCDTrt", s[1]) && s[1] && s[2] == ' ';
+            s = skip_spaces(word_end(s));
+            if (value)
+                s = skip_spaces(word_end(s));
+        }
+        if (*s) {
+            end = word_end(s);
+            names[nnames][0] = base_name(s, end);
+            names[nnames++][1] = end;
+        }
+    }
+
+    size_t pos = 0;
+    const char *s = cmd;
+    for (int i = 0; i <= nnames && pos < size; i++) {
+        const char *from = i < nnames ? names[i][0] : s + strlen(s);
+        if (from > s)
+            pos += snprintf(buf + pos, size - pos, DIM "%.*s" RESET, (int)(from - s), s);
+        if (i < nnames && pos < size)
+            pos += snprintf(buf + pos, size - pos, "%.*s", (int)(names[i][1] - from), from);
+        if (i < nnames)
+            s = names[i][1];
+    }
+}
+
 static void format_mem(char *buf, size_t size, uint64_t bytes) {
     char unit = mem_unit;
     if (!unit)
@@ -420,7 +488,7 @@ static void format_value(char *buf, size_t size, const proc_t *p, enum column co
         break;
     }
     case COL_CMD:
-        snprintf(buf, size, "%s", p->cmd);
+        format_cmd(buf, size, p->cmd);
         break;
     case COL_COUNT:
         buf[0] = 0;
