@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include <dirent.h>
+#include <ctype.h>
 #include <getopt.h>
 #include <inttypes.h>
 #include <pwd.h>
@@ -321,12 +322,18 @@ static void format_time(char *buf, size_t size, uint64_t ns) {
         return;
     }
 
-    /* HH:MM:SS (hours keep counting past a day), hours and minutes highlighted. */
+    /* HH:MM:SS (hours keep counting past a day), leading zero fields dimmed:
+     * 00:05:23 shows "00:" dim, so only the significant part stands out. */
     uint64_t sec = ns / NS_PER_SEC;
-    char head[32], tail[8];
-    snprintf(head, sizeof head, "%02" PRIu64 ":%02" PRIu64, sec / 3600, sec / 60 % 60);
-    snprintf(tail, sizeof tail, ":%02" PRIu64, sec % 60);
-    emit(buf, size, head, tail);
+    snprintf(num, sizeof num, "%02" PRIu64 ":%02" PRIu64 ":%02" PRIu64, sec / 3600,
+             sec / 60 % 60, sec % 60);
+    size_t lead = 0;
+    while (strncmp(num + lead, "00:", 3) == 0)
+        lead += 3;
+    if (color && lead)
+        snprintf(buf, size, DIM "%.*s" RESET "%s", (int)lead, num, num + lead);
+    else
+        snprintf(buf, size, "%s", num);
 }
 
 static void format_cpu(char *buf, size_t size, uint64_t ns) {
@@ -528,6 +535,21 @@ static int value_in_next_arg(const char *arg) {
     return 0;
 }
 
+/* Length of the "-c" option at the start of a short-option cluster like
+ * "-acr", up to and including the 'c', when what follows is more options
+ * rather than a delay (as in "-c0.5"); 0 if there's nothing to split. */
+static size_t split_after_c(const char *arg) {
+    if (arg[0] != '-' || arg[1] == '-')
+        return 0;
+    for (const char *s = arg + 1; *s; s++) {
+        if (*s == 's' || *s == 'o')
+            return 0;  /* the rest is their value */
+        if (*s == 'c')
+            return s[1] && !isdigit((unsigned char)s[1]) && s[1] != '.' ? s + 1 - arg : 0;
+    }
+    return 0;
+}
+
 static int parse_delay(const char *s, double *out) {
     char *end;
     double d = strtod(s, &end);
@@ -552,6 +574,7 @@ static void usage(FILE *f) {
             "                       adds the 'now' (%%CPU) column and sorts by it (busiest last)\n"
             "  -o, --columns=LIST   comma-separated columns to show\n"
             "  -s, --sort=[-]COL    sort by COL, '-' for descending (default: pid)\n"
+            "  -m, --mem            sort by memory (rss), biggest last\n"
             "  -r, --reverse        reverse the sort order\n"
             "  -h, --help           show this help\n"
             "\n"
@@ -565,6 +588,7 @@ int main(int argc, char **argv) {
         {"current", optional_argument, NULL, 'c'},
         {"columns", required_argument, NULL, 'o'},
         {"sort",    required_argument, NULL, 's'},
+        {"mem",     no_argument,       NULL, 'm'},
         {"reverse", no_argument,       NULL, 'r'},
         {"all",     no_argument,       NULL, 'a'},
         {"precise", no_argument,       NULL, 'p'},
@@ -582,13 +606,19 @@ int main(int argc, char **argv) {
      * which would read "-rss" as "-r -s s". */
     enum column toggle_col[MAX_COLUMNS];
     int toggle_add[MAX_COLUMNS], ntoggles = 0;
+    /* Room for splitting "-cr" into "-c" "-r": at most one extra per character. */
+    size_t room = argc + 1;
+    for (int i = 1; i < argc; i++)
+        room += strlen(argv[i]);
+    char **args = malloc(room * sizeof *args);
+    args[0] = argv[0];
     int kept = 1;
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         int col;
         if (strcmp(arg, "--") == 0) {
             while (i < argc)
-                argv[kept++] = argv[i++];
+                args[kept++] = argv[i++];
             break;
         }
         if (arg[0] == '+' && arg[1])
@@ -602,15 +632,25 @@ int main(int argc, char **argv) {
             toggle_add[ntoggles++] = arg[0] == '+';
             continue;
         }
-        argv[kept++] = argv[i];
+        /* "-c" takes an optional attached delay, so "-cr" would read "r" as
+         * the delay: split it into "-c" "-r". */
+        for (size_t n; (n = split_after_c(arg)); ) {
+            args[kept++] = strndup(arg, n);
+            char *rest = malloc(strlen(arg + n) + 2);
+            rest[0] = '-';
+            strcpy(rest + 1, arg + n);
+            arg = rest;
+        }
+        args[kept++] = (char *)arg;
         if (value_in_next_arg(arg) && i + 1 < argc)
-            argv[kept++] = argv[++i];
+            args[kept++] = argv[++i];
     }
     argc = kept;
-    argv[argc] = NULL;
+    args[argc] = NULL;
+    argv = args;
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "c::o:s:raphBKMG", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "c::o:s:mraphBKMG", long_options, NULL)) != -1) {
         switch (opt) {
         case 'c':
             delay = 1;
@@ -627,6 +667,9 @@ int main(int argc, char **argv) {
             break;
         case 's':
             sort_arg = optarg;
+            break;
+        case 'm':
+            sort_arg = "rss";  /* ascending: biggest last, next to the prompt */
             break;
         case 'r':
             reverse = 1;
