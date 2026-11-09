@@ -3,8 +3,10 @@
 #include <dirent.h>
 #include <ctype.h>
 #include <getopt.h>
+#include <minicell.h>
 #include <inttypes.h>
 #include <pwd.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -70,6 +72,11 @@ static int sort_desc;
 static int precise;    /* -p: full precision instead of human-friendly values */
 static char mem_unit;  /* -B/-K/-M/-G, 0: pick per value */
 static int color;      /* highlight the leading part of numbers (terminal only) */
+static int live;       /* -t: the live view */
+
+static int show_all;     /* -a: all users' processes, not only ours */
+static char **filters;   /* show only commands containing one of these */
+static int nfilters;
 
 #define BOLD "\033[1m"
 #define DIM "\033[2m"
@@ -474,7 +481,16 @@ static void format_value(char *buf, size_t size, const proc_t *p, enum column co
         format_percent(buf, size, p->pcpu, 5);
         break;
     case COL_NOW:
-        format_percent(buf, size, p->now, 5);
+        if (live && color) {
+            /* Live, the whole value is plain, or dim if it didn't run at all. */
+            char num[64];
+            color = 0;
+            format_percent(num, sizeof num, p->now, 5);
+            color = 1;
+            snprintf(buf, size, p->now == 0 ? DIM "%s" RESET : "%s", num);
+        } else {
+            format_percent(buf, size, p->now, 5);
+        }
         break;
     case COL_RSS:
         format_mem(buf, size, p->rss);
@@ -550,10 +566,13 @@ static void column_text(char *buf, size_t size, const proc_t *p, enum column col
         snprintf(buf, size, "%s", columns[col].header);
 }
 
-static void print_line(const proc_t *p, const enum column *cols, const int *widths,
-                       int ncols, int term_cols) {
-    char line[LINE_MAX_LEN], value[CMDLINE_MAX];
+/* One line of the table into line (LINE_MAX_LEN); p == NULL gives the header. */
+static void build_line(char *line, const proc_t *p, const enum column *cols, const int *widths,
+                       int ncols) {
+    char value[CMDLINE_MAX];
     size_t pos = 0;
+
+    line[0] = 0;
 
     for (int i = 0; i < ncols; i++) {
         column_text(value, sizeof value, p, cols[i]);
@@ -561,14 +580,251 @@ static void print_line(const proc_t *p, const enum column *cols, const int *widt
         int left = columns[cols[i]].left;
         if (left && i == ncols - 1)
             pad = 0;  /* no trailing spaces after the last column */
-        int n = snprintf(line + pos, sizeof line - pos, "%s%*s%s%*s", i ? "  " : "",
+        int n = snprintf(line + pos, LINE_MAX_LEN - pos, "%s%*s%s%*s", i ? "  " : "",
                          left ? 0 : pad, "", value, left ? pad : 0, "");
-        if (n < 0 || (pos += n) >= sizeof line) {
-            pos = sizeof line - 1;
+        if (n < 0 || (pos += n) >= LINE_MAX_LEN)
             break;
+    }
+}
+
+static void print_line(const proc_t *p, const enum column *cols, const int *widths,
+                       int ncols, int term_cols) {
+    char line[LINE_MAX_LEN];
+    build_line(line, p, cols, widths, ncols);
+    print_cut(line, term_cols);
+}
+
+/* Widens each column to its widest value (or header); never narrows it. */
+static void fit_widths(const proc_t *procs, size_t n, const enum column *cols, int ncols,
+                       int *widths) {
+    char value[CMDLINE_MAX];
+    for (int i = 0; i < ncols; i++) {
+        int w = text_width(columns[cols[i]].header);
+        if (w > widths[i])
+            widths[i] = w;
+        for (size_t j = 0; j < n; j++) {
+            format_value(value, sizeof value, &procs[j], cols[i]);
+            w = text_width(value);
+            if (w > widths[i])
+                widths[i] = w;
         }
     }
-    print_cut(line, term_cols);
+}
+
+static void free_procs(proc_t *procs, size_t n) {
+    for (size_t i = 0; i < n; i++)
+        free(procs[i].cmd);
+    free(procs);
+}
+
+/* All processes that can be read, sorted by pid. If measure, also %NOW: the
+ * CPU usage since prev (sorted by pid), sampled from interval_start_ns on. */
+static size_t collect(proc_t **out, const proc_t *prev, size_t nprev,
+                      uint64_t interval_start_ns, int measure) {
+    proc_t *procs;
+    size_t n = scan_pids(&procs), kept = 0;
+    for (size_t i = 0; i < n; i++) {
+        proc_t *p = &procs[i];
+        if (read_proc(p) < 0)
+            continue;
+        if (measure) {
+            const proc_t *before = bsearch(p, prev, nprev, sizeof *prev, compare_pid);
+            if (before && before->sample_ns && before->start_ns == p->start_ns)
+                p->now = 100.0 * (p->cpu_ns - before->cpu_ns) /
+                         (p->sample_ns - before->sample_ns);
+            else
+                /* Started during the interval (or the PID was reused), so all
+                 * of its CPU time was used within the interval. */
+                p->now = 100.0 * p->cpu_ns / (p->sample_ns - interval_start_ns);
+        }
+        procs[kept++] = *p;
+    }
+    *out = procs;
+    return kept;
+}
+
+/* First sample for %NOW: only start and CPU time. */
+static size_t sample_all(proc_t **out) {
+    size_t n = scan_pids(out);
+    for (size_t i = 0; i < n; i++)
+        if (read_sample(&(*out)[i]) < 0)
+            (*out)[i].sample_ns = 0;  /* gone already */
+    return n;
+}
+
+/* Whether p passes -a and the command filters. */
+static int wanted(const proc_t *p) {
+    if (!show_all && p->uid != geteuid())
+        return 0;
+    if (!nfilters)
+        return 1;
+    if (p->pid == getpid())
+        return 0;  /* our own command line contains the filter */
+    for (int f = 0; f < nfilters; f++)
+        if (strcasestr(p->cmd, filters[f]))
+            return 1;
+    return 0;
+}
+
+/* Keeps the wanted processes of procs, in order; returns how many. */
+static size_t filter_procs(proc_t *procs, size_t n) {
+    size_t kept = 0;
+    for (size_t i = 0; i < n; i++)
+        if (wanted(&procs[i]))
+            procs[kept++] = procs[i];
+        else
+            free(procs[i].cmd);
+    return kept;
+}
+
+/* --- Live view (-t) ------------------------------------------------------- */
+
+static volatile sig_atomic_t quit;
+
+static void on_signal(int sig) {
+    (void)sig;
+    quit = 1;
+}
+
+/* Draws s from x up to (not including) column max_x, turning the BOLD, DIM
+ * and RESET escapes that format_value() writes into styles. */
+static void put_styled(mc_screen *scr, int x, int y, int max_x, const char *s, mc_style base) {
+    mc_style style = base;
+    while (*s && x < max_x) {
+        if (*s == '\033') {
+            if (strncmp(s, BOLD, strlen(BOLD)) == 0)
+                style.attrs |= MC_AttrBold;
+            else if (strncmp(s, DIM, strlen(DIM)) == 0)
+                style.attrs |= MC_AttrDim;
+            else
+                style = base;
+            s = skip_escape(s);
+            continue;
+        }
+        s = mc_screen_put(scr, x++, y, s, style);
+        if (!s)
+            break;
+    }
+}
+
+static void draw_top(mc_screen *scr, const proc_t *procs, size_t n, const enum column *cols,
+                     int ncols, int *widths, int *scroll) {
+    char line[LINE_MAX_LEN];
+    int width, height;
+    mc_screen_size(scr, &width, &height);
+    mc_screen_clear(scr);
+
+    int rows = height - 1;
+    if (*scroll > (int)n - rows)
+        *scroll = (int)n - rows;
+    if (*scroll < 0)
+        *scroll = 0;
+
+    fit_widths(procs, n, cols, ncols, widths);
+    mc_style header = mc_style_attributes(mc_style_default(), MC_AttrReverse);
+    for (int x = 0; x < width; x++)
+        mc_screen_set_content(scr, x, 0, ' ', header);
+    build_line(line, NULL, cols, widths, ncols);
+    put_styled(scr, 0, 0, width, line, header);
+
+    for (int y = 1; y <= rows && *scroll + y - 1 < (int)n; y++) {
+        build_line(line, &procs[*scroll + y - 1], cols, widths, ncols);
+        put_styled(scr, 0, y, width, line, mc_style_default());
+    }
+    mc_screen_show(scr);
+}
+
+/* Like top: refreshes every delay seconds until q. */
+static int run_top(const enum column *cols, int ncols, double delay) {
+    mc_screen *scr = mc_screen_init(NULL);
+    if (!scr) {
+        perror("minips: mc_screen_init");
+        return 1;
+    }
+    struct sigaction sa = {0};
+    sa.sa_handler = on_signal;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
+
+    /* prev: every process at the last refresh, by pid, for %NOW.
+     * view: the wanted ones, sorted for display (sharing prev's cmd). */
+    proc_t *prev, *view = NULL;
+    size_t nprev = sample_all(&prev), nview = 0;
+    uint64_t interval_start_ns = clock_ns(CLOCK_BOOTTIME);
+    /* The first refresh comes quickly, so the screen isn't empty for long. */
+    uint64_t next_ns = interval_start_ns + (uint64_t)((delay < 0.2 ? delay : 0.2) * NS_PER_SEC);
+    int widths[MAX_COLUMNS] = {0};
+    int scroll = 0, redraw = 0;
+
+    while (!quit) {
+        uint64_t now_ns = clock_ns(CLOCK_BOOTTIME);
+        if (now_ns >= next_ns) {
+            proc_t *procs;
+            size_t n = collect(&procs, prev, nprev, interval_start_ns, 1);
+            free_procs(prev, nprev);
+            prev = procs;
+            nprev = n;
+            interval_start_ns = now_ns;
+            next_ns = now_ns + (uint64_t)(delay * NS_PER_SEC);
+
+            free(view);
+            view = malloc((n ? n : 1) * sizeof *view);
+            nview = 0;
+            for (size_t i = 0; i < n; i++)
+                if (wanted(&procs[i]))
+                    view[nview++] = procs[i];
+            redraw = 1;
+        }
+        if (redraw) {
+            qsort(view, nview, sizeof *view, compare_procs);
+            draw_top(scr, view, nview, cols, ncols, widths, &scroll);
+            redraw = 0;
+        }
+
+        int height;
+        mc_screen_size(scr, NULL, &height);
+        int page = height > 2 ? height - 2 : 1;
+        uint64_t wait_ns = next_ns - clock_ns(CLOCK_BOOTTIME);
+        if ((int64_t)wait_ns < 0)
+            wait_ns = 0;
+        mc_event ev;
+        int r = mc_screen_poll_event(scr, &ev, (int)(wait_ns / 1000000) + 1);
+        if (r < 0)
+            break;
+        if (r == 0)
+            continue;
+        redraw = 1;
+        if (ev.type != MC_EventKey)
+            continue;  /* resize: just redraw */
+        int ch = ev.key == MC_KeyRune ? (int)ev.rune : 0;
+        if (ch == 'q' || ev.key == MC_KeyEscape || ev.key == MC_KeyCtrlC)
+            break;
+        else if (ev.key == MC_KeyUp || ch == 'k')
+            scroll--;
+        else if (ev.key == MC_KeyDown || ch == 'j')
+            scroll++;
+        else if (ev.key == MC_KeyPgUp)
+            scroll -= page;
+        else if (ev.key == MC_KeyPgDn || ch == ' ')
+            scroll += page;
+        else if (ev.key == MC_KeyHome)
+            scroll = 0;
+        else if (ev.key == MC_KeyEnd)
+            scroll = (int)nview;  /* draw_top clamps it */
+        else if (ch == 'r')
+            sort_desc = !sort_desc;
+        else if (ch == 'c' || ch == 'm' || ch == 'p') {
+            sort_col = ch == 'c' ? COL_NOW : ch == 'm' ? COL_RSS : COL_PID;
+            sort_desc = ch != 'p';  /* biggest on top */
+            scroll = 0;
+        }
+    }
+
+    mc_screen_fini(scr);
+    free(view);
+    free_procs(prev, nprev);
+    return 0;
 }
 
 static int lookup_column(const char *name) {
@@ -644,6 +900,9 @@ static void usage(FILE *f) {
             "  -s, --sort=[-]COL    sort by COL, '-' for descending (default: pid)\n"
             "  -m, --mem            sort by memory (rss), biggest last\n"
             "  -r, --reverse        reverse the sort order\n"
+            "  -t, --top            live view like top, refreshed every -c SEC (default 1),\n"
+            "                       busiest on top; keys: q quit, arrows/PgUp/PgDn/Home/End\n"
+            "                       scroll, c/m/p sort by %%CPU/memory/pid, r reverse\n"
             "  -h, --help           show this help\n"
             "\n"
             "Columns:\n");
@@ -658,6 +917,7 @@ int main(int argc, char **argv) {
         {"sort",    required_argument, NULL, 's'},
         {"mem",     no_argument,       NULL, 'm'},
         {"reverse", no_argument,       NULL, 'r'},
+        {"top",     no_argument,       NULL, 't'},
         {"all",     no_argument,       NULL, 'a'},
         {"precise", no_argument,       NULL, 'p'},
         {"help",    no_argument,       NULL, 'h'},
@@ -668,7 +928,8 @@ int main(int argc, char **argv) {
     const char *columns_arg = NULL;
     const char *sort_arg = NULL;
     int reverse = 0;
-    int all = 0;
+    int by_mem = 0;
+    int top = 0;
 
     /* "+col" / "-col" add or remove columns. Take them out before getopt,
      * which would read "-rss" as "-r -s s". */
@@ -718,7 +979,7 @@ int main(int argc, char **argv) {
     argv = args;
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "c::o:s:mraphBKMG", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "c::o:s:mrtaphBKMG", long_options, NULL)) != -1) {
         switch (opt) {
         case 'c':
             delay = 1;
@@ -738,12 +999,16 @@ int main(int argc, char **argv) {
             break;
         case 'm':
             sort_arg = "rss";  /* ascending: biggest last, next to the prompt */
+            by_mem = 1;
+            break;
+        case 't':
+            top = 1;
             break;
         case 'r':
             reverse = 1;
             break;
         case 'a':
-            all = 1;
+            show_all = 1;
             break;
         case 'p':
             precise = 1;
@@ -762,8 +1027,10 @@ int main(int argc, char **argv) {
             return 2;
         }
     }
-    char **filters = argv + optind;
-    int nfilters = argc - optind;
+    filters = argv + optind;
+    nfilters = argc - optind;
+    if (top && !delay)
+        delay = 1;
 
     enum column cols[MAX_COLUMNS];
     int ncols = 0;
@@ -809,6 +1076,10 @@ int main(int argc, char **argv) {
     } else if (delay) {
         sort_col = COL_NOW;  /* ascending: busiest last, next to the prompt */
     }
+    /* -c and -m put the biggest last, next to the prompt; on a live screen
+     * the top is where you look. */
+    if (top && (!sort_arg || by_mem))
+        sort_desc = 1;
     sort_desc ^= reverse;
 
     int uses_now = sort_col == COL_NOW;
@@ -823,6 +1094,12 @@ int main(int argc, char **argv) {
     page_size = sysconf(_SC_PAGESIZE);
     total_ram = (uint64_t)sysconf(_SC_PHYS_PAGES) * page_size;
 
+    if (top) {
+        color = !getenv("NO_COLOR");
+        live = 1;
+        return run_top(cols, ncols, delay);
+    }
+
     /* Cut lines to the terminal width; when piped, print everything. */
     int tty = isatty(STDOUT_FILENO);
     color = tty && !getenv("NO_COLOR");
@@ -836,10 +1113,7 @@ int main(int argc, char **argv) {
     uint64_t interval_start_ns = 0;
     if (delay) {
         interval_start_ns = clock_ns(CLOCK_BOOTTIME);
-        nfirst = scan_pids(&first);
-        for (size_t i = 0; i < nfirst; i++)
-            if (read_sample(&first[i]) < 0)
-                first[i].sample_ns = 0;  /* gone already */
+        nfirst = sample_all(&first);
 
         struct timespec ts = {(time_t)delay, (long)((delay - (time_t)delay) * NS_PER_SEC)};
         while (nanosleep(&ts, &ts) < 0)
@@ -847,49 +1121,12 @@ int main(int argc, char **argv) {
     }
 
     proc_t *procs;
-    size_t n = scan_pids(&procs), shown = 0;
-    for (size_t i = 0; i < n; i++) {
-        proc_t *p = &procs[i];
-        if (read_proc(p) < 0)
-            continue;
-        if (!all && p->uid != geteuid())
-            continue;
-        if (nfilters) {
-            if (p->pid == getpid())
-                continue;  /* our own command line contains the filter */
-            int match = 0;
-            for (int f = 0; f < nfilters && !match; f++)
-                match = strcasestr(p->cmd, filters[f]) != NULL;
-            if (!match)
-                continue;
-        }
-
-        if (delay) {
-            proc_t *prev = bsearch(p, first, nfirst, sizeof *first, compare_pid);
-            if (prev && prev->sample_ns && prev->start_ns == p->start_ns)
-                p->now = 100.0 * (p->cpu_ns - prev->cpu_ns) / (p->sample_ns - prev->sample_ns);
-            else
-                /* Started during the interval (or the PID was reused), so all
-                 * of its CPU time was used within the interval. */
-                p->now = 100.0 * p->cpu_ns / (p->sample_ns - interval_start_ns);
-        }
-        procs[shown++] = *p;
-    }
-
+    size_t shown = collect(&procs, first, nfirst, interval_start_ns, delay != 0);
+    shown = filter_procs(procs, shown);
     qsort(procs, shown, sizeof *procs, compare_procs);
 
-    /* Each column as wide as its widest value (or header). */
-    int widths[MAX_COLUMNS];
-    char value[CMDLINE_MAX];
-    for (int i = 0; i < ncols; i++) {
-        widths[i] = text_width(columns[cols[i]].header);
-        for (size_t j = 0; j < shown; j++) {
-            format_value(value, sizeof value, &procs[j], cols[i]);
-            int w = text_width(value);
-            if (w > widths[i])
-                widths[i] = w;
-        }
-    }
+    int widths[MAX_COLUMNS] = {0};
+    fit_widths(procs, shown, cols, ncols, widths);
 
     // print_line(NULL, cols, widths, ncols, term_cols);
     for (size_t i = 0; i < shown; i++)
