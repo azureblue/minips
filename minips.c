@@ -707,6 +707,195 @@ static void put_styled(mc_screen *scr, int x, int y, int max_x, const char *s, m
     }
 }
 
+/* --- CPU and memory summary (-t) --- */
+
+#define MAX_CPUS 1024
+
+/* Cumulative times from /proc/stat, in ticks. */
+struct cpu_times {
+    uint64_t user;   /* user + nice */
+    uint64_t sys;    /* system + irq + softirq + steal */
+    uint64_t total;  /* the above + idle + iowait; 0: CPU offline */
+};
+
+/* Index 0 is all CPUs together, i + 1 is cpu i. */
+static struct cpu_times cpu_before[MAX_CPUS + 1];
+static double cpu_user[MAX_CPUS + 1], cpu_sys[MAX_CPUS + 1];  /* fractions, last interval */
+static int ncpus;
+
+/* CPUs grouped by core: core_cpus[core_first[c] .. core_first[c + 1]). */
+static int core_cpus[MAX_CPUS], core_first[MAX_CPUS + 1], ncores;
+
+static uint64_t mem_total, mem_used, swap_total, swap_used;  /* bytes */
+
+static void read_cpu_times(struct cpu_times *t) {
+    memset(t, 0, (MAX_CPUS + 1) * sizeof *t);
+    FILE *f = fopen("/proc/stat", "r");
+    if (!f)
+        return;
+    char line[512];
+    while (fgets(line, sizeof line, f) && strncmp(line, "cpu", 3) == 0) {
+        char *s = line + 3;
+        int i = 0;
+        if (*s != ' ') {
+            i = strtol(s, &s, 10) + 1;
+            if (i > MAX_CPUS)
+                continue;
+            if (i > ncpus)
+                ncpus = i;
+        }
+        uint64_t v[8] = {0};
+        for (int k = 0; k < 8; k++)
+            v[k] = strtoull(s, &s, 10);
+        /* user nice system idle iowait irq softirq steal */
+        t[i].user = v[0] + v[1];
+        t[i].sys = v[2] + v[5] + v[6] + v[7];
+        t[i].total = t[i].user + t[i].sys + v[3] + v[4];
+    }
+    fclose(f);
+}
+
+/* Usage of each CPU since the last call. */
+static void update_cpu_usage(void) {
+    static struct cpu_times now[MAX_CPUS + 1];
+    read_cpu_times(now);
+    for (int i = 0; i <= ncpus; i++) {
+        uint64_t total = now[i].total - cpu_before[i].total;
+        int valid = now[i].total && cpu_before[i].total && total;
+        cpu_user[i] = valid ? (double)(now[i].user - cpu_before[i].user) / total : 0;
+        cpu_sys[i] = valid ? (double)(now[i].sys - cpu_before[i].sys) / total : 0;
+        cpu_before[i] = now[i];
+    }
+}
+
+static int read_topology_id(int cpu, const char *name) {
+    char path[128], buf[32];
+    snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/%s", cpu, name);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return -1;
+    int id = fgets(buf, sizeof buf, f) ? atoi(buf) : -1;
+    fclose(f);
+    return id;
+}
+
+/* Groups the CPUs (hyperthreads) by core, cores in order of their first CPU. */
+static void read_topology(void) {
+    int package[MAX_CPUS], core[MAX_CPUS], done[MAX_CPUS] = {0};
+    for (int c = 0; c < ncpus; c++) {
+        package[c] = read_topology_id(c, "physical_package_id");
+        core[c] = read_topology_id(c, "core_id");
+    }
+    int n = 0;
+    ncores = 0;
+    for (int c = 0; c < ncpus; c++) {
+        if (done[c])
+            continue;
+        core_first[ncores++] = n;
+        for (int d = c; d < ncpus; d++)
+            if (!done[d] && (d == c || (core[c] >= 0 && package[d] == package[c] &&
+                                        core[d] == core[c]))) {
+                core_cpus[n++] = d;
+                done[d] = 1;
+            }
+    }
+    core_first[ncores] = n;
+}
+
+static void read_meminfo(void) {
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f)
+        return;
+    char line[256];
+    uint64_t available = 0, swap_free = 0;
+    while (fgets(line, sizeof line, f)) {
+        char *colon = strchr(line, ':');
+        if (!colon)
+            continue;
+        uint64_t kb = strtoull(colon + 1, NULL, 10);
+        *colon = 0;
+        if (strcmp(line, "MemTotal") == 0)
+            mem_total = kb << 10;
+        else if (strcmp(line, "MemAvailable") == 0)
+            available = kb << 10;
+        else if (strcmp(line, "SwapTotal") == 0)
+            swap_total = kb << 10;
+        else if (strcmp(line, "SwapFree") == 0)
+            swap_free = kb << 10;
+    }
+    fclose(f);
+    mem_used = mem_total - available;
+    swap_used = swap_total - swap_free;
+}
+
+static int put_text(mc_screen *scr, int x, int y, const char *text, mc_style style) {
+    int n = mc_screen_put_str_styled(scr, x, y, text, style);
+    return n > 0 ? x + n : x;
+}
+
+/* One cell per CPU, its usage as the height of a block; dim ▁ when idle.
+ * The CPUs of a core touch, so every other one is gray instead of white. */
+static int draw_cpu_cell(mc_screen *scr, int x, int y, int cpu, int gray) {
+    static const char *const levels[] = {"▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"};
+    double used = cpu_user[cpu] + cpu_sys[cpu];
+    int level = (int)(used * 8 + 0.5);
+    mc_style style = mc_style_default();
+    if (level == 0)
+        style = mc_style_attributes(style, MC_AttrDim);
+    else if (mc_screen_colors(scr) >= 256)
+        style = mc_style_foreground(style, gray ? 245 : 15);
+    else if (mc_screen_colors(scr) >= 16)
+        style = mc_style_foreground(style, gray ? 7 : 15);
+    mc_screen_put(scr, x, y, levels[level ? level - 1 : 0], style);
+    return x + 1;
+}
+
+/* Draws the summary at the top: total CPU usage, a cell per CPU (a space
+ * between cores), then memory and swap.
+ * Returns the number of lines used. */
+static int draw_summary(mc_screen *scr, int width) {
+    char text[64];
+    mc_style plain = mc_style_default();
+    mc_style dim = mc_style_attributes(plain, MC_AttrDim);
+    int x = 0, y = 0;
+
+    x = put_text(scr, x, y, "cpu  ", dim);
+    snprintf(text, sizeof text, "%3.0f%%  ", 100 * (cpu_user[0] + cpu_sys[0]));
+    int indent = put_text(scr, x, y, text, plain);
+    x = indent;
+    for (int c = 0; c < ncores; c++) {
+        int cells = core_first[c + 1] - core_first[c] + 1;
+        if (x > indent && x + cells > width) {
+            x = indent;  /* wrap, under the first core */
+            y++;
+        } else if (c) {
+            x++;
+        }
+        for (int k = core_first[c]; k < core_first[c + 1]; k++)
+            x = draw_cpu_cell(scr, x, y, core_cpus[k] + 1, (k - core_first[c]) % 2);
+    }
+
+    /* Memory after the CPUs, or on its own line if it doesn't fit. */
+    snprintf(text, sizeof text, "%.1f/%.1fG", mem_used / 1073741824.0, mem_total / 1073741824.0);
+    int mem_width = 5 + (int)strlen(text);
+    x += 4;
+    if (x + mem_width > width) {
+        x = 0;
+        y++;
+    }
+    x = put_text(scr, x, y, "mem  ", dim);
+    x = put_text(scr, x, y, text, plain);
+    if (swap_total) {
+        x = put_text(scr, x + 4, y, "swap  ", dim);
+        snprintf(text, sizeof text, "%.1f/%.1fG", swap_used / 1073741824.0,
+                 swap_total / 1073741824.0);
+        put_text(scr, x, y, text, plain);
+    }
+    return y + 1;
+}
+
+static int visible_rows;  /* process lines on the screen, for PgUp / PgDn */
+
 static void draw_top(mc_screen *scr, const proc_t *procs, size_t n, const enum column *cols,
                      int ncols, int *widths, int *scroll) {
     char line[LINE_MAX_LEN];
@@ -714,7 +903,9 @@ static void draw_top(mc_screen *scr, const proc_t *procs, size_t n, const enum c
     mc_screen_size(scr, &width, &height);
     mc_screen_clear(scr);
 
-    int rows = height - 1;
+    int top = draw_summary(scr, width) + 1;  /* and an empty line */
+    int rows = height - top - 1;
+    visible_rows = rows;
     if (*scroll > (int)n - rows)
         *scroll = (int)n - rows;
     if (*scroll < 0)
@@ -723,13 +914,13 @@ static void draw_top(mc_screen *scr, const proc_t *procs, size_t n, const enum c
     fit_widths(procs, n, cols, ncols, widths);
     mc_style header = mc_style_attributes(mc_style_default(), MC_AttrReverse);
     for (int x = 0; x < width; x++)
-        mc_screen_set_content(scr, x, 0, ' ', header);
+        mc_screen_set_content(scr, x, top, ' ', header);
     build_line(line, NULL, cols, widths, ncols);
-    put_styled(scr, 0, 0, width, line, header);
+    put_styled(scr, 0, top, width, line, header);
 
-    for (int y = 1; y <= rows && *scroll + y - 1 < (int)n; y++) {
-        build_line(line, &procs[*scroll + y - 1], cols, widths, ncols);
-        put_styled(scr, 0, y, width, line, mc_style_default());
+    for (int i = 0; i < rows && *scroll + i < (int)n; i++) {
+        build_line(line, &procs[*scroll + i], cols, widths, ncols);
+        put_styled(scr, 0, top + 1 + i, width, line, mc_style_default());
     }
     mc_screen_show(scr);
 }
@@ -751,6 +942,8 @@ static int run_top(const enum column *cols, int ncols, double delay) {
      * view: the wanted ones, sorted for display (sharing prev's cmd). */
     proc_t *prev, *view = NULL;
     size_t nprev = sample_all(&prev), nview = 0;
+    update_cpu_usage();
+    read_topology();
     uint64_t interval_start_ns = clock_ns(CLOCK_BOOTTIME);
     /* The first refresh comes quickly, so the screen isn't empty for long. */
     uint64_t next_ns = interval_start_ns + (uint64_t)((delay < 0.2 ? delay : 0.2) * NS_PER_SEC);
@@ -766,6 +959,8 @@ static int run_top(const enum column *cols, int ncols, double delay) {
             prev = procs;
             nprev = n;
             interval_start_ns = now_ns;
+            update_cpu_usage();
+            read_meminfo();
             next_ns = now_ns + (uint64_t)(delay * NS_PER_SEC);
 
             free(view);
@@ -782,9 +977,7 @@ static int run_top(const enum column *cols, int ncols, double delay) {
             redraw = 0;
         }
 
-        int height;
-        mc_screen_size(scr, NULL, &height);
-        int page = height > 2 ? height - 2 : 1;
+        int page = visible_rows > 1 ? visible_rows - 1 : 1;
         uint64_t wait_ns = next_ns - clock_ns(CLOCK_BOOTTIME);
         if ((int64_t)wait_ns < 0)
             wait_ns = 0;
