@@ -33,7 +33,7 @@ struct proc {
     uint64_t sample_ns;  /* CLOCK_BOOTTIME right after cpu_ns was read */
     uint64_t elapsed_ns;
     double pcpu;         /* cpu_ns / elapsed_ns: average over the whole life */
-    double now;          /* usage during the -c interval */
+    double now;          /* usage during the -c interval; -1: not measured yet */
     uint64_t rss;        /* bytes */
     char *cmd;
 };
@@ -269,7 +269,9 @@ static int compare_procs(const void *a, const void *b) {
     case COL_TIME:    r = CMP(q->start_ns, p->start_ns); break;
     case COL_CPU:     r = CMP(p->cpu_ns, q->cpu_ns); break;
     case COL_PCPU:    r = CMP(p->pcpu, q->pcpu); break;
-    case COL_NOW:     r = CMP(p->now, q->now); break;
+    /* Before the first measurement (-t starting), by the average instead. */
+    case COL_NOW:     r = p->now < 0 && q->now < 0 ? CMP(p->pcpu, q->pcpu)
+                                                   : CMP(p->now, q->now); break;
     case COL_RSS:
     case COL_PMEM:    r = CMP(p->rss, q->rss); break;
     case COL_CMD:     r = strcmp(p->cmd, q->cmd); break;
@@ -481,15 +483,18 @@ static void format_value(char *buf, size_t size, const proc_t *p, enum column co
         format_percent(buf, size, p->pcpu, 5);
         break;
     case COL_NOW:
-        if (live && color) {
-            /* Live, the whole value is plain, or dim if it didn't run at all. */
-            char num[64];
-            color = 0;
-            format_percent(num, sizeof num, p->now, 5);
-            color = 1;
-            snprintf(buf, size, p->now == 0 ? DIM "%s" RESET : "%s", num);
-        } else {
+        if (live) {
+            /* Fixed "ddd.dd", so it doesn't jump around between refreshes; the
+             * whole value plain, or dim if it didn't run at all. Before the
+             * first measurement, the average stands in for it, dim too. */
+            double v = p->now < 0 ? p->pcpu : p->now;
+            snprintf(buf, size, color && p->now <= 0 ? DIM "%6.2f" RESET : "%6.2f", v);
+        } else if (precise) {
             format_percent(buf, size, p->now, 5);
+        } else {
+            char num[64];
+            snprintf(num, sizeof num, "%.2f", p->now);
+            emit_number(buf, size, num, "");
         }
         break;
     case COL_RSS:
@@ -636,6 +641,8 @@ static size_t collect(proc_t **out, const proc_t *prev, size_t nprev,
                 /* Started during the interval (or the PID was reused), so all
                  * of its CPU time was used within the interval. */
                 p->now = 100.0 * p->cpu_ns / (p->sample_ns - interval_start_ns);
+        } else {
+            p->now = -1;
         }
         procs[kept++] = *p;
     }
@@ -722,6 +729,7 @@ struct cpu_times {
 static struct cpu_times cpu_before[MAX_CPUS + 1];
 static double cpu_user[MAX_CPUS + 1], cpu_sys[MAX_CPUS + 1];  /* fractions, last interval */
 static int ncpus;
+static int cpu_measured;  /* cpu_user / cpu_sys hold a measurement */
 
 /* CPUs grouped by core: core_cpus[core_first[c] .. core_first[c + 1]). */
 static int core_cpus[MAX_CPUS], core_first[MAX_CPUS + 1], ncores;
@@ -758,6 +766,7 @@ static void read_cpu_times(struct cpu_times *t) {
 /* Usage of each CPU since the last call. */
 static void update_cpu_usage(void) {
     static struct cpu_times now[MAX_CPUS + 1];
+    static int calls;
     read_cpu_times(now);
     for (int i = 0; i <= ncpus; i++) {
         uint64_t total = now[i].total - cpu_before[i].total;
@@ -766,6 +775,7 @@ static void update_cpu_usage(void) {
         cpu_sys[i] = valid ? (double)(now[i].sys - cpu_before[i].sys) / total : 0;
         cpu_before[i] = now[i];
     }
+    cpu_measured = calls++ > 0;
 }
 
 static int read_topology_id(int cpu, const char *name) {
@@ -853,6 +863,9 @@ static int draw_cpu_cell(mc_screen *scr, int x, int y, int cpu, int gray) {
 /* Draws the summary at the top: total CPU usage, a cell per CPU (a space
  * between cores), then memory and swap.
  * Returns the number of lines used. */
+static double refresh_delay;  /* seconds */
+static int paused;            /* space: no refreshing */
+
 static int draw_summary(mc_screen *scr, int width) {
     char text[64];
     mc_style plain = mc_style_default();
@@ -860,8 +873,11 @@ static int draw_summary(mc_screen *scr, int width) {
     int x = 0, y = 0;
 
     x = put_text(scr, x, y, "cpu  ", dim);
-    snprintf(text, sizeof text, "%3.0f%%  ", 100 * (cpu_user[0] + cpu_sys[0]));
-    int indent = put_text(scr, x, y, text, plain);
+    if (cpu_measured)
+        snprintf(text, sizeof text, "%3.0f%%  ", 100 * (cpu_user[0] + cpu_sys[0]));
+    else
+        snprintf(text, sizeof text, "  -   ");
+    int indent = put_text(scr, x, y, text, cpu_measured ? plain : dim);
     x = indent;
     for (int c = 0; c < ncores; c++) {
         int cells = core_first[c + 1] - core_first[c] + 1;
@@ -889,8 +905,18 @@ static int draw_summary(mc_screen *scr, int width) {
         x = put_text(scr, x + 4, y, "swap  ", dim);
         snprintf(text, sizeof text, "%.1f/%.1fG", swap_used / 1073741824.0,
                  swap_total / 1073741824.0);
-        put_text(scr, x, y, text, plain);
+        x = put_text(scr, x, y, text, plain);
     }
+
+    /* At the right end of the first line: the refresh interval, or paused. */
+    if (paused)
+        snprintf(text, sizeof text, " paused ");
+    else
+        snprintf(text, sizeof text, "every %gs", refresh_delay);
+    int len = (int)strlen(text);
+    if ((y > 0 || x + 4 + len <= width) && len <= width)
+        put_text(scr, width - len, 0, text,
+                 paused ? mc_style_attributes(plain, MC_AttrReverse | MC_AttrBold) : dim);
     return y + 1;
 }
 
@@ -940,28 +966,31 @@ static int run_top(const enum column *cols, int ncols, double delay) {
 
     /* prev: every process at the last refresh, by pid, for %NOW.
      * view: the wanted ones, sorted for display (sharing prev's cmd). */
-    proc_t *prev, *view = NULL;
-    size_t nprev = sample_all(&prev), nview = 0;
-    update_cpu_usage();
-    read_topology();
-    uint64_t interval_start_ns = clock_ns(CLOCK_BOOTTIME);
-    /* The first refresh comes quickly, so the screen isn't empty for long. */
-    uint64_t next_ns = interval_start_ns + (uint64_t)((delay < 0.2 ? delay : 0.2) * NS_PER_SEC);
+    proc_t *prev = NULL, *view = NULL;
+    size_t nprev = 0, nview = 0;
+    /* The first screen comes at once, without %CPU (nothing to compare with
+     * yet); the first measurement after a shorter interval than the rest. */
+    uint64_t interval_start_ns = clock_ns(CLOCK_BOOTTIME), next_ns = interval_start_ns;
+    int first = 1;
     int widths[MAX_COLUMNS] = {0};
+    refresh_delay = delay;
     int scroll = 0, redraw = 0;
 
     while (!quit) {
         uint64_t now_ns = clock_ns(CLOCK_BOOTTIME);
-        if (now_ns >= next_ns) {
+        if (!paused && now_ns >= next_ns) {
             proc_t *procs;
-            size_t n = collect(&procs, prev, nprev, interval_start_ns, 1);
+            size_t n = collect(&procs, prev, nprev, interval_start_ns, !first);
             free_procs(prev, nprev);
             prev = procs;
             nprev = n;
             interval_start_ns = now_ns;
             update_cpu_usage();
+            if (first)
+                read_topology();  /* needs ncpus, from the first update */
             read_meminfo();
-            next_ns = now_ns + (uint64_t)(delay * NS_PER_SEC);
+            next_ns = now_ns + (uint64_t)((first && delay > 0.5 ? 0.5 : delay) * NS_PER_SEC);
+            first = 0;
 
             free(view);
             view = malloc((n ? n : 1) * sizeof *view);
@@ -982,7 +1011,7 @@ static int run_top(const enum column *cols, int ncols, double delay) {
         if ((int64_t)wait_ns < 0)
             wait_ns = 0;
         mc_event ev;
-        int r = mc_screen_poll_event(scr, &ev, (int)(wait_ns / 1000000) + 1);
+        int r = mc_screen_poll_event(scr, &ev, paused ? -1 : (int)(wait_ns / 1000000) + 1);
         if (r < 0)
             break;
         if (r == 0)
@@ -993,13 +1022,13 @@ static int run_top(const enum column *cols, int ncols, double delay) {
         int ch = ev.key == MC_KeyRune ? (int)ev.rune : 0;
         if (ch == 'q' || ev.key == MC_KeyEscape || ev.key == MC_KeyCtrlC)
             break;
-        else if (ev.key == MC_KeyUp || ch == 'k')
+        else if (ev.key == MC_KeyUp)
             scroll--;
-        else if (ev.key == MC_KeyDown || ch == 'j')
+        else if (ev.key == MC_KeyDown)
             scroll++;
         else if (ev.key == MC_KeyPgUp)
             scroll -= page;
-        else if (ev.key == MC_KeyPgDn || ch == ' ')
+        else if (ev.key == MC_KeyPgDn)
             scroll += page;
         else if (ev.key == MC_KeyHome)
             scroll = 0;
@@ -1007,9 +1036,16 @@ static int run_top(const enum column *cols, int ncols, double delay) {
             scroll = (int)nview;  /* draw_top clamps it */
         else if (ch == 'r')
             sort_desc = !sort_desc;
-        else if (ch == 'c' || ch == 'm' || ch == 'p') {
-            sort_col = ch == 'c' ? COL_NOW : ch == 'm' ? COL_RSS : COL_PID;
-            sort_desc = ch != 'p';  /* biggest on top */
+        else if (ch == ' ') {
+            /* Resuming refreshes at once; that %CPU covers the pause too. */
+            paused = !paused;
+            next_ns = clock_ns(CLOCK_BOOTTIME);
+        } else if (ch > 0 && ch < 128 && strchr("catemp", ch)) {
+            static const char keys[] = "catemp";
+            static const enum column by_key[] = {COL_NOW, COL_PCPU, COL_CPU, COL_TIME,
+                                                 COL_RSS, COL_PID};
+            sort_col = by_key[strchr(keys, ch) - keys];
+            sort_desc = ch != 'p';  /* biggest (or longest running) on top */
             scroll = 0;
         }
     }
@@ -1094,8 +1130,9 @@ static void usage(FILE *f) {
             "  -m, --mem            sort by memory (rss), biggest last\n"
             "  -r, --reverse        reverse the sort order\n"
             "  -t, --top            live view like top, refreshed every -c SEC (default 1),\n"
-            "                       busiest on top; keys: q quit, arrows/PgUp/PgDn/Home/End\n"
-            "                       scroll, c/m/p sort by %%CPU/memory/pid, r reverse\n"
+            "                       busiest on top; keys: q quit, space pause, arrows/PgUp/\n"
+            "                       PgDn/Home/End scroll, sort by c %%CPU, a average, t CPU\n"
+            "                       time, e elapsed, m memory, p pid; r reverse\n"
             "  -h, --help           show this help\n"
             "\n"
             "Columns:\n");
