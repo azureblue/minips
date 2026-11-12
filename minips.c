@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include <dirent.h>
+#include <fcntl.h>
 #include <ctype.h>
 #include <getopt.h>
 #include <minicell.h>
@@ -12,6 +13,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -36,6 +38,13 @@ struct proc {
     double now;          /* usage during the -c interval; -1: not measured yet */
     uint64_t rss;        /* bytes */
     char *cmd;
+    char comm[32];       /* name from stat, for "[comm]" without a cmdline */
+    int kthread;
+    /* /proc/<pid>/stat and cmdline, kept open and re-read with pread, so a
+     * refresh needs no open/close. -1: not open. */
+    int stat_fd;
+    int statm_fd;
+    int cmdline_fd;
 };
 
 typedef struct proc proc_t;
@@ -49,18 +58,28 @@ static const struct {
     const char *header;
     int left;  /* left-aligned (text) rather than right-aligned (numbers) */
     const char *desc;
+    int stat_field;  /* the last field of /proc/<pid>/stat the column needs */
 } columns[COL_COUNT] = {
-    [COL_PID]  = {"pid",  "pid",  0, "process ID"},
-    [COL_PPID] = {"ppid", "ppid", 0, "parent process ID"},
-    [COL_USER] = {"user", "user", 1, "owner (effective user)"},
-    [COL_TIME] = {"time", "time", 0, "time since start (elapsed), HH:MM:SS"},
-    [COL_CPU]  = {"cpu",  "cpu",  0, "CPU time used, seconds"},
-    [COL_PCPU] = {"avg",  "%avg",     0, "average CPU usage: CPU time / elapsed time"},
-    [COL_NOW]  = {"now",  "%cpu",     0, "current CPU usage, during the -c interval"},
-    [COL_RSS]  = {"rss",  "rss",  0, "resident memory, MiB"},
-    [COL_PMEM] = {"pmem", "%mem", 0, "RSS / total RAM"},
-    [COL_CMD]  = {"cmd",  "cmd",  1, "command line"},
+    [COL_PID]  = {"pid",  "pid",  0, "process ID", 0},
+    [COL_PPID] = {"ppid", "ppid", 0, "parent process ID", 4},
+    [COL_USER] = {"user", "user", 1, "owner (effective user)", 0},
+    [COL_TIME] = {"time", "time", 0, "time since start (elapsed), HH:MM:SS", 22},
+    [COL_CPU]  = {"cpu",  "cpu",  0, "CPU time used, seconds", 0},
+    [COL_PCPU] = {"avg",  "%avg",     0, "average CPU usage: CPU time / elapsed time", 22},
+    /* Start time tells a reused PID from the process sampled before. */
+    [COL_NOW]  = {"now",  "%cpu",     0, "current CPU usage, during the -c interval", 22},
+    /* RSS from statm: the one in stat is a quick, approximate read. */
+    [COL_RSS]  = {"rss",  "rss",  0, "resident memory, MiB", 0},
+    [COL_PMEM] = {"pmem", "%mem", 0, "RSS / total RAM", 0},
+    [COL_CMD]  = {"cmd",  "cmd",  1, "command line", 9},  /* flags: kernel thread */
 };
+
+/* What has to be read for the columns shown and sorted by: stat up to
+ * stat_fields, statm for memory, and the command line only if it is shown
+ * or filtered on. */
+static int stat_fields = 22;
+static int need_rss = 1;
+static int need_cmd = 1;
 
 static long ticks_per_sec;
 static long page_size;
@@ -88,82 +107,130 @@ static uint64_t clock_ns(clockid_t clock) {
     return (uint64_t)ts.tv_sec * NS_PER_SEC + ts.tv_nsec;
 }
 
-/* Reads /proc/<pid>/<file> into buf, NUL-terminated; returns its length or -1. */
-static long read_proc_file(pid_t pid, const char *file, char *buf, size_t size) {
-    char path[64];
-    snprintf(path, sizeof path, "/proc/%d/%s", (int)pid, file);
-    FILE *f = fopen(path, "r");
-    if (!f)
-        return -1;
-    size_t n = fread(buf, 1, size - 1, f);
-    fclose(f);
+static int proc_fd = -1;  /* /proc, for openat */
+
+/* Reads /proc/<pid>/<file> into buf, NUL-terminated, at most size - 1 bytes
+ * (these files are produced whole, so one read is enough). The file stays
+ * open in *fd and is re-read from the start next time. Returns the length,
+ * or -1 if the process is gone. */
+static long read_proc_file(pid_t pid, const char *file, int *fd, char *buf, size_t size) {
+    if (*fd < 0) {
+        char path[64];
+        snprintf(path, sizeof path, "%d/%s", (int)pid, file);
+        *fd = openat(proc_fd, path, O_RDONLY | O_CLOEXEC);
+        if (*fd < 0)
+            return -1;
+    }
+    ssize_t n = pread(*fd, buf, size - 1, 0);
+    if (n < 0)
+        return -1;  /* ESRCH: the process has exited */
     buf[n] = 0;
     return n;
 }
 
-/* Start time (field 22 of stat) and CPU time, and the moment CPU time was
- * read. This is all that is needed for each of the two -c samples. */
+static void close_proc_files(proc_t *p) {
+    if (p->stat_fd >= 0)
+        close(p->stat_fd);
+    if (p->statm_fd >= 0)
+        close(p->statm_fd);
+    if (p->cmdline_fd >= 0)
+        close(p->cmdline_fd);
+    p->stat_fd = p->statm_fd = p->cmdline_fd = -1;
+}
+
+/* What clock_getcpuclockid() returns (MAKE_PROCESS_CPUCLOCK in the kernel),
+ * without its clock_getres() call to check the process exists. */
+static clockid_t process_cpu_clock(pid_t pid) {
+    return (clockid_t)((~(unsigned)pid << 3) | 2);  /* 2: CPUCLOCK_SCHED */
+}
+
+/* From stat: comm, ppid, flags and start time, as far as needed; then the
+ * CPU time and the moment it was read. All a -c sample needs. */
 static int read_sample(proc_t *p) {
     char buf[1024];
-    if (read_proc_file(p->pid, "stat", buf, sizeof buf) <= 0)
+    if (read_proc_file(p->pid, "stat", &p->stat_fd, buf, sizeof buf) <= 0)
         return -1;
 
     /* Field 2 is "(comm)" and comm may contain spaces and ')', so fields
      * 3 onwards start after the last ')'. */
-    char *s = strrchr(buf, ')');
-    if (!s)
+    char *open = strchr(buf, '('), *s = strrchr(buf, ')');
+    if (!open || !s)
         return -1;
+    snprintf(p->comm, sizeof p->comm, "%.*s", (int)(s - open - 1), open + 1);
     s++;
-    for (int field = 3; field < 22; field++) {
+    uint64_t field_value[23] = {0};
+    for (int field = 3; field <= stat_fields; field++) {
         while (*s == ' ')
             s++;
-        if (field == 4)
-            p->ppid = strtol(s, NULL, 10);
+        field_value[field] = strtoull(s, NULL, 10);  /* 0 for field 3, the state letter */
         while (*s && *s != ' ')
             s++;
     }
-    char *end;
-    uint64_t start_ticks = strtoull(s, &end, 10);
-    if (end == s)
-        return -1;
-    p->start_ns = start_ticks * NS_PER_SEC / ticks_per_sec;
+    p->ppid = field_value[4];
+    p->kthread = (field_value[9] & 0x00200000) != 0;  /* PF_KTHREAD */
+    p->start_ns = field_value[22] * NS_PER_SEC / ticks_per_sec;
 
     /* Whole process in ns, including threads that have already exited. */
     /* For another process the kernel doesn't add the time its threads have
      * been running since the last scheduler tick (1 ms at HZ=1000), so each
      * reading can lag by up to a tick. */
-    clockid_t clock;
     struct timespec ts;
-    if (clock_getcpuclockid(p->pid, &clock) != 0 || clock_gettime(clock, &ts) < 0)
+    if (clock_gettime(process_cpu_clock(p->pid), &ts) < 0)
         return -1;
     p->cpu_ns = (uint64_t)ts.tv_sec * NS_PER_SEC + ts.tv_nsec;
     p->sample_ns = clock_ns(CLOCK_BOOTTIME);
     return 0;
 }
 
+/* Name of uid, cached for every uid seen. */
 static const char *user_name(uid_t uid) {
-    static uid_t cached_uid = (uid_t)-1;
-    static char name[32];
+    static struct {
+        uid_t uid;
+        char name[9];
+    } *cache;
+    static size_t n, cap;
 
-    if (uid != cached_uid) {
-        struct passwd *pw = getpwuid(uid);
-        if (pw)
-            snprintf(name, sizeof name, "%s", pw->pw_name);
-        else
-            snprintf(name, sizeof name, "%u", (unsigned)uid);
-        /* Like ps: names longer than 8 characters become 7 + "+". */
-        if (strlen(name) > 8) {
-            name[7] = '+';
-            name[8] = 0;
+    for (size_t i = 0; i < n; i++)
+        if (cache[i].uid == uid)
+            return cache[i].name;
+    if (n == cap) {
+        cap = cap ? cap * 2 : 16;
+        cache = realloc(cache, cap * sizeof *cache);
+        if (!cache) {
+            perror("realloc");
+            exit(1);
         }
-        cached_uid = uid;
     }
-    return name;
+    char name[64];
+    struct passwd *pw = getpwuid(uid);
+    if (pw)
+        snprintf(name, sizeof name, "%s", pw->pw_name);
+    else
+        snprintf(name, sizeof name, "%u", (unsigned)uid);
+    /* Like ps: names longer than 8 characters become 7 + "+". */
+    if (strlen(name) > 8) {
+        name[7] = '+';
+        name[8] = 0;
+    }
+    cache[n].uid = uid;
+    snprintf(cache[n].name, sizeof cache[n].name, "%s", name);
+    return cache[n++].name;
 }
 
-static char *read_cmdline(pid_t pid) {
+/* Second field of statm: resident pages. */
+static uint64_t read_rss(proc_t *p) {
+    char buf[256];
+    if (read_proc_file(p->pid, "statm", &p->statm_fd, buf, sizeof buf) <= 0)
+        return 0;
+    char *s = buf;
+    strtoull(s, &s, 10);
+    return strtoull(s, NULL, 10) * page_size;
+}
+
+static char *read_cmdline(proc_t *p) {
     char buf[CMDLINE_MAX];
-    long n = read_proc_file(pid, "cmdline", buf, sizeof buf);
+    /* Kernel threads have no cmdline: show [comm] like ps does. */
+    long n = p->kthread ? 0 : read_proc_file(p->pid, "cmdline", &p->cmdline_fd, buf, sizeof buf);
     if (n > 0) {
         while (n > 0 && buf[n - 1] == 0)
             n--;
@@ -177,39 +244,30 @@ static char *read_cmdline(pid_t pid) {
         buf[n] = 0;
         return strdup(buf);
     }
-
-    /* Kernel threads have no cmdline: show [comm] like ps does. */
-    char comm[32];
-    n = read_proc_file(pid, "comm", comm, sizeof comm);
-    if (n > 0 && comm[n - 1] == '\n')
-        comm[n - 1] = 0;
-    snprintf(buf, sizeof buf, "[%s]", n > 0 ? comm : "?");
+    snprintf(buf, sizeof buf, "[%s]", p->comm);
     return strdup(buf);
 }
 
-/* Second field of statm: resident pages. */
-static uint64_t read_rss(pid_t pid) {
-    char buf[256];
-    if (read_proc_file(pid, "statm", buf, sizeof buf) <= 0)
-        return 0;
-    char *s = buf;
-    strtoull(s, &s, 10);
-    return strtoull(s, NULL, 10) * page_size;
-}
-
 static int read_proc(proc_t *p) {
-    char path[64];
-    struct stat st;
-    snprintf(path, sizeof path, "/proc/%d", (int)p->pid);
-    if (stat(path, &st) < 0 || read_sample(p) < 0)
+    if (read_sample(p) < 0)
         return -1;
 
-    p->uid = st.st_uid;
-    snprintf(p->user, sizeof p->user, "%s", user_name(st.st_uid));
+    /* The owner of /proc/<pid> is the effective user (its files belong to
+     * root if the process isn't dumpable). Read once, when the files are
+     * opened; a later setuid() isn't noticed. */
+    if (!p->user[0]) {
+        char name[16];
+        struct stat st;
+        snprintf(name, sizeof name, "%d", (int)p->pid);
+        if (fstatat(proc_fd, name, &st, 0) < 0)
+            return -1;
+        p->uid = st.st_uid;
+        snprintf(p->user, sizeof p->user, "%s", user_name(st.st_uid));
+    }
     p->elapsed_ns = p->sample_ns - p->start_ns;
     p->pcpu = p->elapsed_ns ? 100.0 * p->cpu_ns / p->elapsed_ns : 0;
-    p->rss = read_rss(p->pid);
-    p->cmd = read_cmdline(p->pid);
+    p->rss = need_rss ? read_rss(p) : 0;
+    p->cmd = need_cmd ? read_cmdline(p) : strdup("");
     return 0;
 }
 
@@ -228,11 +286,17 @@ static int compare_pid(const void *a, const void *b) {
 
 /* All PIDs in /proc, sorted. Only pid is filled in. */
 static size_t scan_pids(proc_t **out) {
-    DIR *dir = opendir("/proc");
+    /* Opened once; each scan rewinds it, which re-reads the listing. */
+    static DIR *dir;
     if (!dir) {
-        perror("/proc");
-        exit(1);
+        dir = opendir("/proc");
+        if (!dir) {
+            perror("/proc");
+            exit(1);
+        }
+        proc_fd = dirfd(dir);
     }
+    rewinddir(dir);
 
     size_t n = 0, cap = 0;
     proc_t *procs = NULL;
@@ -249,9 +313,9 @@ static size_t scan_pids(proc_t **out) {
             }
         }
         memset(&procs[n], 0, sizeof *procs);
+        procs[n].stat_fd = procs[n].statm_fd = procs[n].cmdline_fd = -1;
         procs[n++].pid = atoi(de->d_name);
     }
-    closedir(dir);
 
     qsort(procs, n, sizeof *procs, compare_pid);
     *out = procs;
@@ -617,23 +681,44 @@ static void fit_widths(const proc_t *procs, size_t n, const enum column *cols, i
 }
 
 static void free_procs(proc_t *procs, size_t n) {
-    for (size_t i = 0; i < n; i++)
+    for (size_t i = 0; i < n; i++) {
         free(procs[i].cmd);
+        close_proc_files(&procs[i]);
+    }
     free(procs);
 }
 
 /* All processes that can be read, sorted by pid. If measure, also %NOW: the
  * CPU usage since prev (sorted by pid), sampled from interval_start_ns on. */
-static size_t collect(proc_t **out, const proc_t *prev, size_t nprev,
+static size_t collect(proc_t **out, proc_t *prev, size_t nprev,
                       uint64_t interval_start_ns, int measure) {
     proc_t *procs;
     size_t n = scan_pids(&procs), kept = 0;
     for (size_t i = 0; i < n; i++) {
         proc_t *p = &procs[i];
-        if (read_proc(p) < 0)
+        proc_t *before = bsearch(p, prev, nprev, sizeof *prev, compare_pid);
+
+        /* Take over the files kept open since before, and what never changes. */
+        if (before && before->stat_fd >= 0) {
+            p->stat_fd = before->stat_fd;
+            p->statm_fd = before->statm_fd;
+            p->cmdline_fd = before->cmdline_fd;
+            before->stat_fd = before->statm_fd = before->cmdline_fd = -1;
+            p->uid = before->uid;
+            memcpy(p->user, before->user, sizeof p->user);
+        }
+        if (read_proc(p) < 0 && p->user[0]) {
+            /* The files were of a process that has exited; its PID may have
+             * been reused by a new one. */
+            close_proc_files(p);
+            p->user[0] = 0;
+            read_proc(p);
+        }
+        if (!p->cmd) {
+            close_proc_files(p);
             continue;
+        }
         if (measure) {
-            const proc_t *before = bsearch(p, prev, nprev, sizeof *prev, compare_pid);
             if (before && before->sample_ns && before->start_ns == p->start_ns)
                 p->now = 100.0 * (p->cpu_ns - before->cpu_ns) /
                          (p->sample_ns - before->sample_ns);
@@ -677,10 +762,12 @@ static int wanted(const proc_t *p) {
 static size_t filter_procs(proc_t *procs, size_t n) {
     size_t kept = 0;
     for (size_t i = 0; i < n; i++)
-        if (wanted(&procs[i]))
+        if (wanted(&procs[i])) {
             procs[kept++] = procs[i];
-        else
+        } else {
             free(procs[i].cmd);
+            close_proc_files(&procs[i]);
+        }
     return kept;
 }
 
@@ -1318,6 +1405,29 @@ int main(int argc, char **argv) {
     if (uses_now && !delay) {
         fprintf(stderr, "minips: the 'now' (%%CPU) column needs -c\n");
         return 2;
+    }
+
+    /* Read only what is shown or sorted by; the live view can be re-sorted
+     * by any of its keys. */
+    stat_fields = columns[sort_col].stat_field;
+    need_cmd = nfilters || sort_col == COL_CMD;
+    need_rss = sort_col == COL_RSS || sort_col == COL_PMEM;
+    for (int i = 0; i < ncols; i++) {
+        if (columns[cols[i]].stat_field > stat_fields)
+            stat_fields = columns[cols[i]].stat_field;
+        need_cmd |= cols[i] == COL_CMD;
+        need_rss |= cols[i] == COL_RSS || cols[i] == COL_PMEM;
+    }
+    if (top) {
+        stat_fields = 22;  /* any key can sort by time, memory, ... */
+        need_rss = 1;
+    }
+
+    /* Three files are kept open per process; allow as many as we may. */
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
+        rl.rlim_cur = rl.rlim_max;
+        setrlimit(RLIMIT_NOFILE, &rl);
     }
 
     ticks_per_sec = sysconf(_SC_CLK_TCK);
